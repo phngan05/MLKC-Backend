@@ -17,7 +17,7 @@ class BaseQueryTranslator(ABC):
         self._llm = llm
 
     @abstractmethod
-    def translate(self, query: str) -> list[str]:
+    async def translate(self, query: str) -> list[str]:
         """Return a list of (possibly transformed) queries."""
 
 
@@ -26,7 +26,7 @@ class BaseQueryTranslator(ABC):
 # ======================================================================== #
 
 class NoTranslation(BaseQueryTranslator):
-    def translate(self, query: str) -> list[str]:
+    async def translate(self, query: str) -> list[str]:
         return [query]
 
 
@@ -50,8 +50,8 @@ class RAGFusionTranslator(BaseQueryTranslator):
         self._n = n
         self._chain = self._PROMPT | self._llm
 
-    def translate(self, query: str) -> list[str]:
-        response = self._chain.invoke({"question": query, "n": self._n})
+    async def translate(self, query: str) -> list[str]:
+        response = await self._chain.ainvoke({"question": query, "n": self._n})
         queries = [q.strip() for q in response.content.strip().split("\n") if q.strip()]
         logger.debug("RAG-Fusion queries: %s", queries)
         return queries[:self._n]
@@ -79,8 +79,8 @@ class StepbackTranslator(BaseQueryTranslator):
         super().__init__(llm)
         self._chain = self._PROMPT | self._llm
 
-    def translate(self, query: str) -> list[str]:
-        response = self._chain.invoke({"question": query})
+    async def translate(self, query: str) -> list[str]:
+        response = await self._chain.ainvoke({"question": query})
         stepback_q = response.content.strip()
         logger.debug("Stepback query: %s", stepback_q)
         # Return both so caller retrieves with each
@@ -108,8 +108,8 @@ class HyDETranslator(BaseQueryTranslator):
         super().__init__(llm)
         self._chain = self._PROMPT | self._llm
 
-    def translate(self, query: str) -> list[str]:
-        response = self._chain.invoke({"question": query})
+    async def translate(self, query: str) -> list[str]:
+        response = await self._chain.ainvoke({"question": query})
         hypothetical_doc = response.content.strip()
         logger.debug("HyDE hypothetical doc (first 120 chars): %s...", hypothetical_doc[:120])
         # Use the hypothetical doc as the embedding query
@@ -142,8 +142,8 @@ class QueryTranslationMethod_Classifier:
     def __init__(self, llm: ChatGroq):
         self._chain = self._PROMPT | llm
 
-    def classify(self, query: str) -> QueryTranslationMethod:
-        response = self._chain.invoke({"question": query})
+    async def classify(self, query: str) -> QueryTranslationMethod:
+        response = await self._chain.ainvoke({"question": query})
         raw = response.content.strip().lower()
         try:
             method = QueryTranslationMethod(raw)

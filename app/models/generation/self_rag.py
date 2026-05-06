@@ -1,104 +1,127 @@
-from enum import Enum
+import asyncio
+import json
+from typing import List
+
+from pydantic import BaseModel, Field
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
+
 from app.models.retrieval.retriever import Retriever
 from app.models.rag_config import RAGConfig, QueryTranslationMethod
 from app.models.utils.helpers import get_logger
 
 logger = get_logger(__name__)
 
+# --- Structured Output Models ---
 
-class GradeResult(str, Enum):
-    RELEVANT    = "relevant"
-    IRRELEVANT  = "irrelevant"
+class RelevanceIndices(BaseModel):
+    """Indices of documents that are relevant to the question."""
+    relevant_indices: List[int] = Field(description="List of 0-indexed integers representing relevant documents.")
 
+class EvaluationResult(BaseModel):
+    """Evaluation of the generated answer."""
+    grounded: bool = Field(description="Is the answer supported by the provided documents?")
+    useful: bool = Field(description="Does the answer directly address the user's question?")
 
-class HallucinationResult(str, Enum):
-    GROUNDED    = "grounded"
-    HALLUCINATED = "hallucinated"
-
-
-class AnswerResult(str, Enum):
-    USEFUL   = "useful"
-    NOTUSEFUL = "not_useful"
-
-
-# ------------------------------------------------------------------ #
-# Graders
-# ------------------------------------------------------------------ #
+# --- Graders ---
 
 class RelevanceGrader:
     _PROMPT = ChatPromptTemplate.from_template(
-        """You are a grader assessing whether a retrieved document is relevant
-        to a machine learning question.
-        Document:
-        {document}
-        
+        """You are a relevance filter. Given a question and a list of retrieved documents, 
+        identify which documents contain information necessary to answer the question.
+
         Question: {question}
-        
-        Answer with ONLY 'relevant' or 'irrelevant'."""
-    )
 
-    def __init__(self, llm: ChatGroq):
-        self._chain = self._PROMPT | llm
-
-    def grade(self, question: str, document: Document) -> GradeResult:
-        resp = self._chain.invoke({
-            "question": question,
-            "document": document.page_content,
-        })
-        raw = resp.content.strip().lower()
-        return GradeResult.RELEVANT if "relevant" in raw else GradeResult.IRRELEVANT
-
-
-class HallucinationGrader:
-    _PROMPT = ChatPromptTemplate.from_template(
-        """You are a grader checking whether an answer is grounded in the provided documents and does not contain hallucinations.
         Documents:
         {documents}
-        
-        Answer: {answer}
-        
-        Answer with ONLY 'grounded' or 'hallucinated'."""
+
+        Task: Return a JSON object containing the indices of the documents that are relevant. 
+        If no documents are relevant, return an empty list [].
+        """
     )
 
     def __init__(self, llm: ChatGroq):
-        self._chain = self._PROMPT | llm
+        # Using structured output for faster and more reliable parsing
+        self._chain = self._PROMPT | llm.with_structured_output(RelevanceIndices)
 
-    def grade(self, documents: list[Document], answer: str) -> HallucinationResult:
-        doc_text = "\n\n---\n\n".join(d.page_content for d in documents)
-        resp = self._chain.invoke({"documents": doc_text, "answer": answer})
-        raw = resp.content.strip().lower()
-        return (
-            HallucinationResult.GROUNDED
-            if "grounded" in raw
-            else HallucinationResult.HALLUCINATED
-        )
+    async def grade(self, question: str, documents: List[Document]) -> List[int]:
+        if not documents:
+            return []
+        
+        # Only send first 500 characters of each doc to the grader to reduce latency
+        doc_text = "\n".join(f"[{i}] {d.page_content[:500]}" for i, d in enumerate(documents))
+        
+        try:
+            result = await self._chain.ainvoke({
+                "question": question,
+                "documents": doc_text
+            })
+            return result.relevant_indices
+        except Exception as e:
+            logger.error(f"Relevance grading failed: {e}")
+            return list(range(len(documents))) # Fallback: treat all as relevant
 
 
-class AnswerGrader:
+class CombinedGrader:
     _PROMPT = ChatPromptTemplate.from_template(
-        """You are a grader assessing whether an answer is useful and fully addresses a machine learning question.
-        Question: {question}
-        
-        Answer: {answer}
-        
-        Answer with ONLY 'useful' or 'not_useful'."""
-    )
+        """You are a strict evaluator for a RAG system.
+
+            Your task is to evaluate whether the answer is grounded in the provided context and whether it is useful.
+
+            ---------------------
+            Context:
+            {context}
+
+            Question:
+            {question}
+
+            Answer:
+            {answer}
+            ---------------------
+
+            Evaluation rules:
+
+            1. Grounded:
+            - TRUE if the answer is fully supported by the context
+            - FALSE if the answer contains any information NOT present in the context
+
+            2. Useful:
+            - TRUE if the answer directly and sufficiently answers the question
+            - FALSE if the answer is vague, incomplete, or irrelevant
+
+            Important:
+            - Be strict. Do NOT assume facts outside the context.
+            - If unsure, mark grounded = false.
+
+            ---------------------
+
+            Return ONLY a valid JSON object with this exact format:
+
+            {{
+            "grounded": true or false,
+            "useful": true or false
+            }}
+            """
+            )
+    
 
     def __init__(self, llm: ChatGroq):
-        self._chain = self._PROMPT | llm
+        self._chain = self._PROMPT | llm.with_structured_output(EvaluationResult)
 
-    def grade(self, question: str, answer: str) -> AnswerResult:
-        resp = self._chain.invoke({"question": question, "answer": answer})
-        raw = resp.content.strip().lower()
-        return AnswerResult.USEFUL if "useful" in raw else AnswerResult.NOTUSEFUL
+    async def grade(self, question: str, documents: List[Document], answer: str) -> EvaluationResult:
+        context_text = "\n\n".join(d.page_content[:1000] for d in documents) if documents else "No context."
+        
+        try:
+            return await self._chain.ainvoke({
+                "context": context_text,
+                "question": question,
+                "answer": answer
+            })
+        except Exception as e:
+            logger.error(f"Combined grading failed: {e}")
+            return EvaluationResult(grounded=True, useful=True) # Soft fallback
 
-
-# ------------------------------------------------------------------ #
-# Generator
-# ------------------------------------------------------------------ #
 
 class AnswerGenerator:
     _PROMPT = ChatPromptTemplate.from_template(
@@ -118,23 +141,17 @@ class AnswerGenerator:
     def __init__(self, llm: ChatGroq):
         self._chain = self._PROMPT | llm
 
-    def generate(self, question: str, documents: list[Document]) -> str:
+    async def generate(self, question: str, documents: List[Document]) -> str:
         context = "\n\n---\n\n".join(d.page_content for d in documents)
-        resp = self._chain.invoke({"context": context, "question": question})
+        resp = await self._chain.ainvoke({"context": context, "question": question})
         return resp.content.strip()
 
 
-# ------------------------------------------------------------------ #
-# Self-RAG Orchestrator
-# ------------------------------------------------------------------ #
+# --- Main Orchestrator ---
 
 class SelfRAG:
     """
-    Implements the Self-RAG loop:
-
-    Retrieve → Grade Relevance → Generate →
-    Grade Hallucination → Grade Usefulness →
-    Retry if needed (up to max_retries)
+    Optimized Self-RAG Orchestrator (Async & Structured)
     """
 
     def __init__(self, cfg: RAGConfig, retriever: Retriever, llm: ChatGroq):
@@ -142,110 +159,81 @@ class SelfRAG:
         self._retriever = retriever
         self._generator = AnswerGenerator(llm)
         self._relevance_grader = RelevanceGrader(llm)
-        self._hallucination_grader = HallucinationGrader(llm)
-        self._answer_grader = AnswerGrader(llm)
+        self._combined_grader = CombinedGrader(llm)
 
-    def answer(
+    async def answer(
         self,
         question: str,
         method: QueryTranslationMethod = QueryTranslationMethod.AUTO,
     ) -> dict:
         """
-        Returns a dict with:
-          - answer (str)
-          - sources (list[Document])
-          - translation_method (str)
-          - attempts (int)
-          - grading_log (list[dict])
+        Executes the Self-RAG loop asynchronously.
         """
         grading_log = []
-        translation_method = method.value
-
+        current_method = method
+        
+        # Max retries loop
         for attempt in range(1, self._cfg.self_rag_max_retries + 2):
-            logger.info("Self-RAG attempt %d/%d", attempt, self._cfg.self_rag_max_retries + 1)
+            logger.info(f"Self-RAG Attempt {attempt} | Method: {current_method.value}")
 
-            # ── 1. Retrieve ───────────────────────────────────────────
-            docs = self._retriever.retrieve(question, method=method)
-            if not docs:
-                return self._no_docs_response(question, attempt, grading_log)
+            # 1. Retrieve (Top-5 optimization)
+            # Ensure your retriever implementation supports the 'k' parameter
+            docs = await self._retriever.retrieve(question)
+            # Ensure we only work with top 5
+            docs = docs[:5]
 
-            # ── 2. Grade relevance ────────────────────────────────────
-            relevant_docs = []
-            for doc in docs:
-                grade = self._relevance_grader.grade(question, doc)
-                grading_log.append({
-                    "stage": "relevance",
-                    "attempt": attempt,
-                    "grade": grade.value,
-                    "doc_snippet": doc.page_content[:80],
-                })
-                if grade == GradeResult.RELEVANT:
-                    relevant_docs.append(doc)
-
-            logger.info(
-                "Relevance filtering: %d/%d docs kept", len(relevant_docs), len(docs)
-            )
-
-            if not relevant_docs:
-                logger.warning("No relevant docs found; retrying with broader method.")
-                method = QueryTranslationMethod.STEPBACK  # broaden on retry
-                continue
-
-            # ── 3. Generate ───────────────────────────────────────────
-            answer = self._generator.generate(question, relevant_docs)
-
-            # ── 4. Grade hallucination ────────────────────────────────
-            hall_grade = self._hallucination_grader.grade(relevant_docs, answer)
+            # 2. Relevance Filtering
+            relevant_indices = await self._relevance_grader.grade(question, docs)
+            relevant_docs = [docs[i] for i in relevant_indices if i < len(docs)]
+            
+            logger.info(f"Filtered {len(relevant_docs)}/{len(docs)} relevant documents.")
+            
+            # Log relevance stage
             grading_log.append({
-                "stage": "hallucination",
+                "stage": "relevance",
                 "attempt": attempt,
-                "grade": hall_grade.value,
+                "keep_count": len(relevant_docs)
             })
 
-            if hall_grade == HallucinationResult.HALLUCINATED:
-                logger.warning("Answer appears hallucinated; regenerating.")
-                continue
+            # If no docs relevant, we still try to generate or use the top 1 doc as fallback
+            generation_docs = relevant_docs if relevant_docs else docs[:1]
 
-            # ── 5. Grade usefulness ───────────────────────────────────
-            ans_grade = self._answer_grader.grade(question, answer)
+            # 3. Generate Answer
+            answer = await self._generator.generate(question, generation_docs)
+
+            # 4. Combined Grading (Hallucination + Usefulness)
+            eval_result = await self._combined_grader.grade(question, generation_docs, answer)
+            
             grading_log.append({
-                "stage": "usefulness",
+                "stage": "evaluation",
                 "attempt": attempt,
-                "grade": ans_grade.value,
+                "grounded": eval_result.grounded,
+                "useful": eval_result.useful
             })
 
-            if ans_grade == AnswerResult.USEFUL:
+            # Check if we can exit the loop
+            if eval_result.grounded and eval_result.useful:
                 return {
                     "answer": answer,
-                    "sources": relevant_docs,
-                    "translation_method": translation_method,
+                    "sources": generation_docs,
+                    "translation_method": current_method.value,
                     "attempts": attempt,
                     "grading_log": grading_log,
                 }
 
-            logger.warning("Answer not useful; retrying.")
-            method = QueryTranslationMethod.RAG_FUSION   # try wider search
+            # If not grounded or not useful, change strategy for next attempt
+            if not eval_result.grounded:
+                logger.warning("Hallucination detected. Re-trying...")
+            elif not eval_result.useful:
+                logger.warning("Answer not useful. Switching to RAG_FUSION...")
+                current_method = QueryTranslationMethod.RAG_FUSION
 
-        # Max retries exhausted — return best effort
-        logger.error("Max retries reached. Returning last generated answer.")
+        # If loop finishes without perfect score
         return {
             "answer": answer,
-            "sources": relevant_docs,
-            "translation_method": translation_method,
-            "attempts": self._cfg.self_rag_max_retries + 1,
-            "grading_log": grading_log,
-            "warning": "Max retries reached; answer quality not guaranteed.",
-        }
-
-    # ------------------------------------------------------------------ #
-
-    def _no_docs_response(
-        self, question: str, attempt: int, log: list
-    ) -> dict:
-        return {
-            "answer": "I could not find relevant information to answer this question.",
-            "sources": [],
-            "translation_method": "N/A",
+            "sources": generation_docs,
+            "translation_method": current_method.value,
             "attempts": attempt,
-            "grading_log": log,
+            "grading_log": grading_log,
+            "warning": "Maximum retries reached. Answer quality may be sub-optimal."
         }

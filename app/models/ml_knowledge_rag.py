@@ -38,12 +38,12 @@ class MLKnowledgeRAG:
         self._retriever = Retriever(self._cfg, self._vsm, self._llm)
         self._self_rag = SelfRAG(self._cfg, self._retriever, self._llm)
 
-    def query(
+    async def query(
         self,
         question: str,
         method: QueryTranslationMethod = QueryTranslationMethod.AUTO,
     ) -> dict:
         """Ask a question; returns answer, sources, and grading metadata."""
-        result = self._self_rag.answer(question, method=method)
+        result = await self._self_rag.answer(question, method=method)
         answer = format_answer(result)
         return answer

@@ -26,9 +26,9 @@ class QueryRouter:
     def __init__(self, llm: ChatGroq):
         self._chain = self._PROMPT | llm
 
-    def route(self, query: str) -> list[str]:
+    async def route(self, query: str) -> list[str]:
         """Returns a list of store keys: ['text'], ['code'], or ['text', 'code']."""
-        response = self._chain.invoke({"question": query})
+        response = await self._chain.ainvoke({"question": query})
         decision = response.content.strip().lower()
 
         if decision == "text":

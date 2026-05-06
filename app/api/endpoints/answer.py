@@ -6,9 +6,9 @@ from app.schemas.question import QuestionRequest
 router = APIRouter()
     
 @router.post("")
-def answer(data: QuestionRequest, rag: MLKnowledgeRAG = Depends(get_rag_service)):
+async def answer(data: QuestionRequest, rag: MLKnowledgeRAG = Depends(get_rag_service)):
     try:
-        result = rag.query(data.question)
+        result = await rag.query(data.question)
         return {"question": data.question, "answer" : result}
     except Exception as e:
         print(f"DEBUG ERROR: {e}")
